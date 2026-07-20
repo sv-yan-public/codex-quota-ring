@@ -1,0 +1,23 @@
+{
+  "name": "codex-quota-ring",
+  "version": "0.1.0",
+  "description": "Live Codex allowance indicator for the macOS menu bar.",
+  "author": {
+    "name": "Codex Quota Ring"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Quota Ring",
+    "shortDescription": "See remaining Codex quota in the menu bar.",
+    "longDescription": "Installs and manages a private native macOS menu-bar ring that reads live Codex rate-limit windows locally.",
+    "developerName": "Codex Quota Ring",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read"],
+    "brandColor": "#22C55E",
+    "defaultPrompt": [
+      "Install Codex Quota Ring.",
+      "Check whether my quota ring is running.",
+      "Troubleshoot my quota ring."
+    ]
+  }
+}

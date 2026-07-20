@@ -1,0 +1,25 @@
+#!/bin/zsh
+
+LABEL="dev.quota-ring.codex"
+SYSTEM_PLIST="/Library/LaunchAgents/$LABEL.plist"
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console)"
+
+if [[ -z "$CONSOLE_USER" || "$CONSOLE_USER" == "root" || "$CONSOLE_USER" == "loginwindow" ]]; then
+  exit 0
+fi
+
+CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER")"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+
+/bin/launchctl bootout "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
+
+# Remove the repository installer's older per-user copy to avoid duplicate jobs.
+if [[ -n "$USER_HOME" ]]; then
+  /bin/rm -f "$USER_HOME/Library/LaunchAgents/$LABEL.plist"
+  /bin/rm -rf "$USER_HOME/Applications/Codex Quota Ring.app"
+fi
+
+/bin/launchctl bootstrap "gui/$CONSOLE_UID" "$SYSTEM_PLIST" 2>/dev/null || true
+/bin/launchctl kickstart -k "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
+
+exit 0
