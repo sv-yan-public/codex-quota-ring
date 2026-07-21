@@ -181,6 +181,11 @@ final class RingView: NSView {
     var percent = 0 { didSet { needsDisplay = true } }
     var isError = false { didSet { needsDisplay = true } }
 
+    // The ring is purely decorative. Let mouse events pass through to the
+    // underlying NSStatusBarButton so its menu still opens when the ring is
+    // clicked.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         let bounds = self.bounds.insetBy(dx: 2, dy: 2)

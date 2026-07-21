@@ -31,5 +31,6 @@ sed "s|__APP_BINARY__|$CONTENTS/MacOS/CodexQuotaRing|g" \
   > "$HOME/Library/LaunchAgents/dev.quota-ring.codex.plist"
 
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.quota-ring.codex.plist"
+launchctl kickstart -k "gui/$UID/dev.quota-ring.codex"
 
 echo "Installed $APP_DIR"
