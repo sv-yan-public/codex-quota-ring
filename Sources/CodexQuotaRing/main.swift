@@ -9,13 +9,25 @@ struct LimitWindow {
 }
 
 final class CodexClient {
+    private struct PendingRequest {
+        let completion: (Result<[String: Any], Error>) -> Void
+        let timeout: DispatchWorkItem
+    }
+
+    private struct ClientError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
     private let errorOutput = Pipe()
     private var buffer = Data()
     private var nextID = 1
-    private var handlers: [Int: ([String: Any]) -> Void] = [:]
+    private var handlers: [Int: PendingRequest] = [:]
+    private var isRefreshing = false
+    private var retryWorkItem: DispatchWorkItem?
     private let queue = DispatchQueue(label: "dev.quota-ring.codex-client")
     var onLimits: (([LimitWindow]) -> Void)?
     var onError: ((String) -> Void)?
@@ -47,9 +59,14 @@ final class CodexClient {
                 self.request("initialize", params: [
                     "clientInfo": ["name": "codex-quota-ring", "title": "Codex Quota Ring", "version": "0.1.0"],
                     "capabilities": NSNull()
-                ]) { [weak self] _ in
-                    self?.notify("initialized")
-                    self?.refresh()
+                ]) { [weak self] result in
+                    switch result {
+                    case .success:
+                        self?.notify("initialized")
+                        self?.refresh()
+                    case .failure(let error):
+                        self?.reportError("Codex 初始化失败：\(error.localizedDescription)")
+                    }
                 }
             } catch {
                 self.reportError("无法启动 codex：\(error.localizedDescription)")
@@ -71,8 +88,24 @@ final class CodexClient {
 
     func refresh() {
         queue.async { [weak self] in
-            self?.request("account/rateLimits/read", params: NSNull()) { [weak self] response in
-                self?.parseLimits(response)
+            guard let self, !self.isRefreshing else { return }
+            self.isRefreshing = true
+            self.request("account/rateLimits/read", params: NSNull()) { [weak self] result in
+                guard let self else { return }
+                self.isRefreshing = false
+                switch result {
+                case .success(let response):
+                    do {
+                        let windows = try self.parseLimits(response)
+                        self.retryWorkItem?.cancel()
+                        self.retryWorkItem = nil
+                        DispatchQueue.main.async { [weak self] in self?.onLimits?(windows) }
+                    } catch {
+                        self.handleRefreshFailure(error.localizedDescription)
+                    }
+                case .failure(let error):
+                    self.handleRefreshFailure(error.localizedDescription)
+                }
             }
         }
     }
@@ -82,25 +115,33 @@ final class CodexClient {
         if process.isRunning { process.terminate() }
     }
 
-    private func request(_ method: String, params: Any, completion: @escaping ([String: Any]) -> Void) {
+    private func request(_ method: String, params: Any, completion: @escaping (Result<[String: Any], Error>) -> Void) {
         let id = nextID
         nextID += 1
-        handlers[id] = completion
-        send(["id": id, "method": method, "params": params])
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let pending = self?.handlers.removeValue(forKey: id) else { return }
+            pending.completion(.failure(ClientError(message: "请求超时")))
+        }
+        handlers[id] = PendingRequest(completion: completion, timeout: timeout)
+        queue.asyncAfter(deadline: .now() + 15, execute: timeout)
+        do {
+            try send(["id": id, "method": method, "params": params])
+        } catch {
+            timeout.cancel()
+            handlers.removeValue(forKey: id)
+            completion(.failure(error))
+        }
     }
 
     private func notify(_ method: String) {
-        send(["method": method])
+        do { try send(["method": method]) }
+        catch { reportError("无法与 Codex 通信：\(error.localizedDescription)") }
     }
 
-    private func send(_ object: [String: Any]) {
-        do {
-            var data = try JSONSerialization.data(withJSONObject: object)
-            data.append(0x0A)
-            try input.fileHandleForWriting.write(contentsOf: data)
-        } catch {
-            reportError("无法与 Codex 通信：\(error.localizedDescription)")
-        }
+    private func send(_ object: [String: Any]) throws {
+        var data = try JSONSerialization.data(withJSONObject: object)
+        data.append(0x0A)
+        try input.fileHandleForWriting.write(contentsOf: data)
     }
 
     private func consume(_ data: Data) {
@@ -112,11 +153,12 @@ final class CodexClient {
                   let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
             else { continue }
 
-            if let id = json["id"] as? Int, let handler = handlers.removeValue(forKey: id) {
+            if let id = json["id"] as? Int, let pending = handlers.removeValue(forKey: id) {
+                pending.timeout.cancel()
                 if let error = json["error"] as? [String: Any] {
-                    reportError(error["message"] as? String ?? "Codex 返回未知错误")
+                    pending.completion(.failure(ClientError(message: error["message"] as? String ?? "Codex 返回未知错误")))
                 } else {
-                    handler(json)
+                    pending.completion(.success(json))
                 }
             } else if json["method"] as? String == "account/rateLimits/updated" {
                 refresh()
@@ -124,18 +166,16 @@ final class CodexClient {
         }
     }
 
-    private func parseLimits(_ response: [String: Any]) {
+    private func parseLimits(_ response: [String: Any]) throws -> [LimitWindow] {
         guard let result = response["result"] as? [String: Any] else {
-            reportError("Codex 未返回额度数据")
-            return
+            throw ClientError(message: "Codex 未返回额度数据")
         }
         var snapshot = result["rateLimits"] as? [String: Any]
         if let buckets = result["rateLimitsByLimitId"] as? [String: Any] {
             snapshot = (buckets["codex"] as? [String: Any]) ?? snapshot ?? (buckets.values.first as? [String: Any])
         }
         guard let snapshot else {
-            reportError("当前账户没有可显示的额度窗口")
-            return
+            throw ClientError(message: "当前账户没有可显示的额度窗口")
         }
 
         var windows: [LimitWindow] = []
@@ -150,10 +190,20 @@ final class CodexClient {
             windows.append(LimitWindow(name: "消费额度", remaining: max(0, min(100, remaining)), resetsAt: date(from: spend["resetsAt"])))
         }
         guard !windows.isEmpty else {
-            reportError("当前套餐未提供百分比额度")
-            return
+            throw ClientError(message: "当前套餐未提供百分比额度")
         }
-        DispatchQueue.main.async { [weak self] in self?.onLimits?(windows) }
+        return windows
+    }
+
+    private func handleRefreshFailure(_ message: String) {
+        reportError(message)
+        guard retryWorkItem == nil else { return }
+        let retry = DispatchWorkItem { [weak self] in
+            self?.retryWorkItem = nil
+            self?.refresh()
+        }
+        retryWorkItem = retry
+        queue.asyncAfter(deadline: .now() + 5, execute: retry)
     }
 
     private func window(from value: [String: Any], fallbackName: String) -> LimitWindow {
@@ -243,6 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updatedItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private var windowItems: [NSMenuItem] = []
     private var timer: Timer?
+    private var consecutiveFailures = 0
+    private var hasSuccessfulSnapshot = false
     private let ringView = RingView(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -261,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         client.onLimits = { [weak self] in self?.show($0) }
         client.onError = { [weak self] in self?.showError($0) }
         client.start()
-        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.client.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.client.refresh() }
     }
 
     func applicationWillTerminate(_ notification: Notification) { client.stop() }
@@ -283,6 +335,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show(_ windows: [LimitWindow]) {
+        consecutiveFailures = 0
+        hasSuccessfulSnapshot = true
         windowItems.forEach { menu.removeItem($0) }
         windowItems.removeAll()
         let tightest = windows.map(\.remaining).min() ?? 0
@@ -304,9 +358,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showError(_ message: String) {
-        ringView.isError = true
-        summaryItem.title = "额度读取失败"
-        updatedItem.title = message
+        consecutiveFailures += 1
+        let shouldShowError = !hasSuccessfulSnapshot || consecutiveFailures >= 3
+        ringView.isError = shouldShowError
+        if shouldShowError { summaryItem.title = "额度读取失败" }
+        updatedItem.title = "刷新失败（\(consecutiveFailures)/3）：\(message)"
         statusItem.button?.toolTip = message
     }
 
