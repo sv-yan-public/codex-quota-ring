@@ -6,6 +6,7 @@ struct LimitWindow {
     let name: String
     let remaining: Int
     let resetsAt: Date?
+    let durationMinutes: Int?
 }
 
 final class CodexClient {
@@ -187,7 +188,12 @@ final class CodexClient {
         }
         if let spend = snapshot["individualLimit"] as? [String: Any],
            let remaining = spend["remainingPercent"] as? Int {
-            windows.append(LimitWindow(name: "消费额度", remaining: max(0, min(100, remaining)), resetsAt: date(from: spend["resetsAt"])))
+            windows.append(LimitWindow(
+                name: "消费额度",
+                remaining: max(0, min(100, remaining)),
+                resetsAt: date(from: spend["resetsAt"]),
+                durationMinutes: nil
+            ))
         }
         guard !windows.isEmpty else {
             throw ClientError(message: "当前套餐未提供百分比额度")
@@ -210,10 +216,17 @@ final class CodexClient {
         let used = value["usedPercent"] as? Int ?? 0
         let minutes = value["windowDurationMins"] as? Int
         let name: String
-        if let minutes, minutes < 24 * 60 { name = "\(max(1, minutes / 60)) 小时额度" }
+        if minutes == 5 * 60 { name = "5 小时额度" }
+        else if minutes == 7 * 24 * 60 { name = "每周额度" }
+        else if let minutes, minutes < 24 * 60 { name = "\(max(1, minutes / 60)) 小时额度" }
         else if let minutes { name = "\(max(1, minutes / (24 * 60))) 天额度" }
         else { name = fallbackName }
-        return LimitWindow(name: name, remaining: max(0, min(100, 100 - used)), resetsAt: date(from: value["resetsAt"]))
+        return LimitWindow(
+            name: name,
+            remaining: max(0, min(100, 100 - used)),
+            resetsAt: date(from: value["resetsAt"]),
+            durationMinutes: minutes
+        )
     }
 
     private func date(from value: Any?) -> Date? {
@@ -229,6 +242,7 @@ final class CodexClient {
 
 final class RingView: NSView {
     var percent = 0 { didSet { needsDisplay = true } }
+    var isAvailable = false { didSet { needsDisplay = true } }
     var isError = false { didSet { needsDisplay = true } }
 
     // The ring is purely decorative. Let mouse events pass through to the
@@ -241,7 +255,7 @@ final class RingView: NSView {
         let bounds = self.bounds.insetBy(dx: 2, dy: 2)
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
         let radius = min(bounds.width, bounds.height) / 2 - 1
-        let color: NSColor = isError ? .systemRed : percent > 50 ? .systemGreen : percent > 20 ? .systemOrange : .systemRed
+        let color: NSColor = isError ? .systemRed : !isAvailable ? .tertiaryLabelColor : percent > 50 ? .systemGreen : percent > 20 ? .systemOrange : .systemRed
         // Preserve the app icon's fixed C shape. Quota only rotates the mark.
         let markerAngle = 90 - CGFloat(100 - percent) * 3.6
         let markerGap: CGFloat = 30
@@ -271,23 +285,52 @@ final class RingView: NSView {
             width: markerRadius * 2,
             height: markerRadius * 2
         ))
-        (isError ? NSColor.systemRed : NSColor.systemYellow).setFill()
+        (isError ? NSColor.systemRed : isAvailable ? NSColor.systemYellow : NSColor.tertiaryLabelColor).setFill()
         marker.fill()
 
-        let text = isError ? "!" : "\(percent)"
+        let text = isError ? "!" : isAvailable ? "\(percent)" : "--"
         let fontSize: CGFloat = percent == 100 ? 7.5 : 9
-        let attributes: [NSAttributedString.Key: Any] = [
+        let valueAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
-        let size = text.size(withAttributes: attributes)
-        text.draw(at: NSPoint(x: center.x - size.width / 2, y: center.y - size.height / 2), withAttributes: attributes)
+        let size = text.size(withAttributes: valueAttributes)
+        text.draw(
+            at: NSPoint(x: center.x - size.width / 2, y: center.y - size.height / 2),
+            withAttributes: valueAttributes
+        )
     }
+}
+
+final class QuotaPairView: NSView {
+    let fiveHourRing = RingView(frame: .zero)
+    let weeklyRing = RingView(frame: .zero)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let stack = NSStackView(views: [fiveHourRing, weeklyRing])
+        stack.orientation = .horizontal
+        stack.spacing = 3
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            fiveHourRing.widthAnchor.constraint(equalToConstant: 24),
+            fiveHourRing.heightAnchor.constraint(equalToConstant: 24),
+            weeklyRing.widthAnchor.constraint(equalToConstant: 24),
+            weeklyRing.heightAnchor.constraint(equalToConstant: 24),
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = CodexClient()
-    private let statusItem = NSStatusBar.system.statusItem(withLength: 30)
+    private let statusItem = NSStatusBar.system.statusItem(withLength: 56)
     private let menu = NSMenu()
     private let summaryItem = NSMenuItem(title: "正在读取额度…", action: nil, keyEquivalent: "")
     private let updatedItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -295,18 +338,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var consecutiveFailures = 0
     private var hasSuccessfulSnapshot = false
-    private let ringView = RingView(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
+    private let quotaView = QuotaPairView(frame: NSRect(x: 0, y: 0, width: 51, height: 24))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem.button?.addSubview(ringView)
-        ringView.translatesAutoresizingMaskIntoConstraints = false
+        statusItem.button?.addSubview(quotaView)
+        quotaView.translatesAutoresizingMaskIntoConstraints = false
         if let button = statusItem.button {
             NSLayoutConstraint.activate([
-                ringView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
-                ringView.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-                ringView.widthAnchor.constraint(equalToConstant: 24),
-                ringView.heightAnchor.constraint(equalToConstant: 24)
+                quotaView.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+                quotaView.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+                quotaView.widthAnchor.constraint(equalToConstant: 51),
+                quotaView.heightAnchor.constraint(equalToConstant: 24)
             ])
         }
         buildMenu()
@@ -339,11 +382,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hasSuccessfulSnapshot = true
         windowItems.forEach { menu.removeItem($0) }
         windowItems.removeAll()
-        let tightest = windows.map(\.remaining).min() ?? 0
-        ringView.percent = tightest
-        ringView.isError = false
-        statusItem.button?.toolTip = "Codex 剩余额度 \(tightest)%"
-        summaryItem.title = "Codex 剩余额度：\(tightest)%"
+        let rateWindows = windows.filter { $0.durationMinutes != nil }
+        let fiveHour = rateWindows.first { $0.durationMinutes == 5 * 60 }
+            ?? rateWindows.first { ($0.durationMinutes ?? .max) < 24 * 60 }
+            ?? rateWindows.first
+        let weekly = rateWindows.first { $0.durationMinutes == 7 * 24 * 60 }
+            ?? rateWindows.first { ($0.durationMinutes ?? 0) >= 24 * 60 }
+            ?? rateWindows.dropFirst().first
+        update(quotaView.fiveHourRing, with: fiveHour)
+        update(quotaView.weeklyRing, with: weekly)
+        quotaView.fiveHourRing.isError = false
+        quotaView.weeklyRing.isError = false
+        let fiveHourText = fiveHour.map { "\($0.remaining)%" } ?? "--"
+        let weeklyText = weekly.map { "\($0.remaining)%" } ?? "--"
+        statusItem.button?.toolTip = "5 小时剩余 \(fiveHourText) · 每周剩余 \(weeklyText)"
+        summaryItem.title = "5 小时：\(fiveHourText)　每周：\(weeklyText)"
         let formatter = DateFormatter()
         formatter.dateStyle = .none
         formatter.timeStyle = .short
@@ -360,7 +413,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showError(_ message: String) {
         consecutiveFailures += 1
         let shouldShowError = !hasSuccessfulSnapshot || consecutiveFailures >= 3
-        ringView.isError = shouldShowError
+        quotaView.fiveHourRing.isError = shouldShowError
+        quotaView.weeklyRing.isError = shouldShowError
         if shouldShowError { summaryItem.title = "额度读取失败" }
         updatedItem.title = "刷新失败（\(consecutiveFailures)/3）：\(message)"
         statusItem.button?.toolTip = message
@@ -368,6 +422,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refresh() { client.refresh() }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    private func update(_ ring: RingView, with window: LimitWindow?) {
+        ring.isAvailable = window != nil
+        ring.percent = window?.remaining ?? 0
+    }
 }
 
 let app = NSApplication.shared

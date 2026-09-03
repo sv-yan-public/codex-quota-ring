@@ -4,9 +4,9 @@ Codex Quota Ring is a Codex plugin with a native macOS menu-bar companion. It di
 
 ## What it shows
 
-- The circle contains the lowest remaining percentage across the active Codex rate-limit windows.
+- Two circles remain visible in the menu bar: the left circle shows the five-hour allowance and the right circle shows the weekly allowance.
 - Green means above 50%, orange means 21–50%, and red means 20% or less.
-- Click the circle for every available window, its remaining percentage, reset time, and last refresh time.
+- Click either circle for every available window, its remaining percentage, reset time, and last refresh time.
 - Data refreshes every 60 seconds and also reacts to Codex rate-limit updates. Transient failures are retried automatically, and the last successful value remains visible unless three consecutive refreshes fail.
 
 The data is read locally from Codex's app-server protocol (`account/rateLimits/read`). No authentication token is copied, logged, or sent to another service.
